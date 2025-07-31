@@ -1,0 +1,555 @@
+# My github: https://github.com/trip5
+
+substitutions:
+  name: stormlamp
+  friendly_name: StormLamp
+  project_name: "Trip5.StormLamp"
+  comment: "StormLamp from Trip5"
+  project_version: "2025.07.31"
+  status_led_pin: GPIO10 # used to show status
+  # 1N5819 Schottky diode prevents power surge on USB port: DC V input ─▶|─> 1Ω -> UPS V input
+  # All ADC Pins: Source -> 100KΩ resistor -> ADC Pin -> 100KΩ resistor -> GND
+  #                                           ADC Pin -> 100nF capacitor -> GND
+  adc_power_in_pin: GPIO1 # measures power input (on 5V / USB line)
+  adc_ups_active_pin: GPIO2 # measures if charging is active (attached to CR LED on back of 5V UPS)
+  adc_battery_pin: GPIO4 # measures battery power
+  adc_light_on_pin: GPIO6 # measures power output (attached to latch V output)
+  adc_light_out_pin: GPIO8 # measures light output (attached to LDO LED output)
+  # One Button used for multiple purposes: trigger for latch (toggles light), detect button presses, enter flash mode
+  input_button_pin: GPIO13 # button to detect, attached to latch (10KΩ pullup resistor to 3V3, 100nF debounce capacitor to GND)
+  latch_trigger_output_pin: GPIO14 # triggers latch on/off ( 1N5819 Schottky diode prevents backfeed: input_button_pin ─▶|─> latch_trigger_output_pin)
+  # 1N4148 Switching diode allows using the same button to enter flash mode: GPIO0 (Button 0) ─▶|─> input_button_pin
+  sleep_duration: "60" # default sleep duration in minutes (range: 10-240 minutes)
+  sleep_enable: "true" # set to "false" for testing a board (if adc_power_in_pin isn't attached to a power input, it will enter sleep quickly)
+  # There are WebUI/HA switches that control the behavior of the light when power is lost or restored. Choose the default mode of the switches:
+  # These are actually 'restore_mode' for the switches (the default option - no need to change if you will change using the WebUI / Home Assistant)
+  # RESTORE_DEFAULT_OFF - Attempt to restore state and default to OFF if not possible to restore
+  # RESTORE_DEFAULT_ON - Attempt to restore state and default to ON
+  # Other options are available but they're not useful (the ALWAYS options over-ride the switch on reboot, INVERTED is weird):  https://esphome.io/components/switch/
+  turn_on_when_power_lost: "RESTORE_DEFAULT_ON"
+  turn_off_when_power_restored: "RESTORE_DEFAULT_ON"
+  # Since mDNS will not function correctly, enter an IP Address here if you need to update it OTA (is NOT used for static IP, only for OTA)
+  ip_address: 192.168.23.164
+
+esphome:
+  name: ${name}
+  comment: "${comment}"
+  project:
+    name: "${project_name}"
+    version: "${project_version}"
+  on_boot:
+      - priority: -100.0
+        then:
+          - wifi.disable
+          - light.turn_on:
+              id: led1
+              transition_length: 0s
+          - lambda: 'id(wakeup_reason) = esp_sleep_get_wakeup_cause();' # determines reason for waking up: 3 = Timer
+          - component.update: wake_reason
+          - script.execute: check_wakeup_reason
+          - script.execute: initialize_sleep_duration
+          - script.execute: check_status_loop
+
+esp32:
+  board: lolin_s2_mini
+  variant: ESP32S2
+  framework:
+    type: arduino
+
+preferences:
+  flash_write_interval: 5s # default is 1min
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  enable_on_boot: False # Keep it off at boot
+  use_address: ${ip_address}
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  ap:
+    ssid: ${name}
+    password: !secret ap_password
+
+mdns:
+  disabled: false
+
+web_server:
+  port: 80
+  # ota: False # if you want to disable it (True is no longer valid)
+  # include_internal: True # probably not necessary, as it will expose more than needed to the Web UI
+
+captive_portal:
+
+# Enable logging (and stops the various sensors/switches from spamming the log) - if you need more data, change to DEBUG
+logger:
+  level: DEBUG
+  logs:
+    light: ERROR
+    script: ERROR
+    sensor: ERROR
+    text_sensor: ERROR
+    binary_sensor: ERROR
+
+# Enable Home Assistant API
+# Due to Wi-fi being disabled at boot (so mDNS fails), you will have to add it to HA by IP address
+api:
+  # delete next 2 lines if not using HA API encryption
+  encryption:
+    key: !secret encryption_key
+  reboot_timeout: 0s # Disabled to keep it from rebooting when not connecting to HA
+
+deep_sleep:
+  id: deep_sleep_control
+  sleep_duration: "24h" # default sleep time (will be overridden dynamically)
+
+globals:
+  - id: wakeup_reason
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: turned_on_by_power_loss
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: led_breathe_script_running
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: power_in_adc_finished
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ups_active_pulse
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ups_active_pulse_check
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: sleep_duration_seconds
+    type: int
+    restore_value: yes
+    initial_value: '3600' # 1 hour in seconds (will be updated by the number component)
+
+
+script:
+  - id: led_breathe
+    # This will make a breathing effect on the status LED
+    mode: restart
+    then:
+      - globals.set:
+          id: led_breathe_script_running
+          value: 'true'
+      - delay: 2s
+      - light.turn_on: led1
+      - delay: 1s
+      - light.turn_off: led1
+      - delay: 2s
+      - script.execute: led_breathe
+# The next few blocks are utilized to update the diagnostic sensors (quickly)
+  - id: update_power_in_adc
+    mode: single
+    then:
+      - repeat:
+          count: 3
+          then:
+            - component.update: power_in_adc
+            - delay: 250ms
+      - lambda: |-
+          ESP_LOGI("custom", "Power In: %.2f V", id(power_in_adc).state);
+          id(power_in_adc_finished) = true; // set a flag
+  - id: update_ups_active_adc
+    # This one was tweaked for my particular module which flashes 3-5 times very quickly in 1 second, goes true if any activity is detected
+    mode: single
+    then:
+      - lambda: 'id(ups_active_pulse_check) = false;'
+      - repeat:
+          count: 20
+          then:
+            - component.update: ups_active_adc
+            - lambda: |-
+                if (id(ups_active_adc).state > 0.05) {
+                  id(ups_active_pulse_check) = true;
+                }
+            - delay: 50ms
+      - lambda: |-
+          id(ups_active_pulse) = id(ups_active_pulse_check);
+          ESP_LOGI("custom", "UPS Pulse Detected: %s", id(ups_active_pulse) ? "True" : "False");
+
+  - id: update_battery_adc
+    mode: single
+    then:
+      - repeat:
+          count: 3
+          then:
+            - component.update: battery_adc
+            - delay: 250ms
+      - lambda: |-
+          ESP_LOGI("custom", "Battery: %.2f V", id(battery_adc).state);
+  - id: update_light_out_adc
+    mode: single
+    then:
+      - repeat:
+          count: 3
+          then:
+            - component.update: light_out_adc
+            - delay: 250ms
+      - lambda: |-
+          ESP_LOGI("custom", "Light Out: %.2f V", id(light_out_adc).state);
+# Here's the main loop
+  - id: check_status_loop
+    mode: restart
+    then:
+      - component.update: light_on_adc
+      - script.execute: update_power_in_adc
+      - script.execute: update_battery_adc
+      - wait_until:
+          condition:
+              lambda: 'return id(power_in_adc_finished);'
+          timeout: 5s
+      - if:
+          condition:
+              and:
+                - lambda: 'return (id(battery_adc).state < 3);'
+                - lambda: '{ std::string v = "${sleep_enable}"; std::transform(v.begin(), v.end(), v.begin(), ::tolower); return v == "true"; }'
+          then:
+            - logger.log: "No Battery! Deep Sleep Activated!"
+            - deep_sleep.enter:
+                id: deep_sleep_control # for 24h... the UPS can't power both bulb and ESP without the battery assisting it (the ESP will brownout)
+      - if:
+          condition:
+              and:
+                - lambda: 'return (id(power_in_adc).state < 3);'
+                - lambda: '{ std::string v = "${sleep_enable}"; std::transform(v.begin(), v.end(), v.begin(), ::tolower); return v == "true"; }'
+          then:
+            - script.execute: check_turn_on_when_power_lost
+            - logger.log: "No Power! Deep Sleep Activated!"
+            - deep_sleep.enter:
+                id: deep_sleep_control
+                sleep_duration: !lambda 'return id(sleep_duration_seconds) * 1000;'
+      - wifi.enable
+      - script.execute: update_ups_active_adc
+      - script.execute: update_light_out_adc
+      - script.execute: check_turn_off_when_power_restored
+      - delay: 2s
+      - component.update: wifisignal
+      - if:
+          condition:
+              and:
+                - binary_sensor.is_on: ups_active
+                - lambda: 'return (id(battery_adc).state < 4.15);' # Because the UPS will continue to be "active" due to the ESP's load
+                # If a UPS is ONLY active during actual charging, comment-out the above line
+          then:
+            - if:
+                condition:
+                  not:
+                    script.is_running: led_breathe
+                then:
+                  - script.execute: led_breathe
+          else:
+            - script.stop: led_breathe
+            - globals.set:
+                id: led_breathe_script_running
+                value: 'false'
+            - light.turn_off: led1
+      - lambda: |-
+          id(turned_on_by_power_loss) = false;
+          id(power_in_adc_finished) = false;
+          id(wakeup_reason) = 3;
+      - script.execute: wait_until_15_second_mark
+  - id: wait_until_15_second_mark  # runs at :00, :15, :30, :45 seconds after boot
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return ((millis() / 1000) % 15 == 0);'
+          then:
+            - script.execute: check_status_loop
+          else:
+            - delay: 1s
+            - script.execute: wait_until_15_second_mark
+# These scripts are what makes it smart, otherwise, you don't really need an ESP!
+  - id: check_wakeup_reason
+    mode: single
+    then:
+      - if:
+          condition:
+            - lambda: 'return (id(wakeup_reason) != 3);'
+          then:
+            - lambda: 'id(turned_on_by_power_loss) = false;'
+  - id: initialize_sleep_duration
+    mode: single
+    then:
+      - lambda: 'if (id(sleep_duration_seconds) <= 0) id(sleep_duration_seconds) = ${sleep_duration} * 60;'
+  - id: check_turn_on_when_power_lost
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: turn_on_when_power_lost
+              - lambda: 'return !(id(light_on_adc).state > 3);'
+              - lambda: 'return !(id(turned_on_by_power_loss));'
+              - lambda: 'return (id(wakeup_reason) == 3);'
+          then:
+            - lambda: 'id(turned_on_by_power_loss) = true;'
+            - button.press: light_toggle
+  - id: check_turn_off_when_power_restored
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: turn_off_when_power_restored
+              - lambda: 'return (id(light_on_adc).state > 3);'
+              - lambda: 'return (id(turned_on_by_power_loss));'
+              - lambda: 'return (id(wakeup_reason) == 3);'
+          then:
+            - lambda: 'id(turned_on_by_power_loss) = false;'
+            - button.press: light_toggle
+
+sensor:  
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal Strength"
+    id: wifisignal
+    update_interval: never
+    unit_of_measurement: "dBm"
+    entity_category: "diagnostic"
+  - platform: adc
+    name: "${friendly_name} Power In"
+    id: power_in_adc
+    update_interval: never
+    pin: ${adc_power_in_pin}
+    attenuation: 12db
+    entity_category: "diagnostic"
+    accuracy_decimals: 2
+    device_class: battery
+    unit_of_measurement: "V"
+    internal: True
+    filters:
+      - multiply: 2
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 1
+  - platform: adc
+    name: "${friendly_name} UPS Active V"
+    id: ups_active_adc
+    update_interval: never
+    pin: ${adc_ups_active_pin}
+    attenuation: 12db
+    entity_category: "diagnostic"
+    accuracy_decimals: 4
+    device_class: battery
+    unit_of_measurement: "V"
+    internal: True
+    filters:
+      - multiply: 2
+  - platform: adc
+    name: "${friendly_name} Battery"
+    id: battery_adc
+    update_interval: never
+    pin: ${adc_battery_pin}
+    attenuation: 12db
+    entity_category: "diagnostic"
+    accuracy_decimals: 2
+    device_class: battery
+    unit_of_measurement: "V"
+    filters:
+      - multiply: 2
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 1
+  - platform: adc
+    name: "${friendly_name} Light On"
+    id: light_on_adc
+    update_interval: never
+    pin: ${adc_light_on_pin}
+    attenuation: 12db
+    entity_category: "diagnostic"
+    accuracy_decimals: 2
+    device_class: battery
+    unit_of_measurement: "V"
+    internal: True
+    filters:
+      - multiply: 2
+  - platform: adc
+    name: "${friendly_name} Light Out"
+    id: light_out_adc
+    update_interval: never
+    pin: ${adc_light_out_pin}
+    attenuation: 12db
+    entity_category: "diagnostic"
+    accuracy_decimals: 2
+    device_class: battery
+    unit_of_measurement: "V"
+    internal: True
+    filters:
+      - multiply: 2
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 1
+
+switch:
+  - platform: template
+    name: "${friendly_name} Turn On Light When Power Lost"
+    id: turn_on_when_power_lost
+    restore_mode: ${turn_on_when_power_lost}
+    optimistic: True
+    device_class: switch
+    turn_on_action:
+        - logger.log: "Turn On Light When Power Lost On"
+    turn_off_action:
+        - logger.log: "Turn On Light When Power Lost Off"
+  - platform: template
+    name: "${friendly_name} Turn Off Light When Power Restored"
+    id: turn_off_when_power_restored
+    restore_mode: ${turn_off_when_power_restored}
+    optimistic: True
+    device_class: switch
+    turn_on_action:
+        - logger.log: "Turn Off Light When Power Restored On"
+    turn_off_action:
+        - logger.log: "Turn Off Light When Power Restored Off"
+  - platform: template
+    name: "${friendly_name} Light"
+    id: light_switch
+    restore_mode: DISABLED
+    device_class: switch
+    lambda: |-
+      return (id(light_on_adc).state > 2);
+    turn_on_action:
+      - button.press: light_toggle
+    turn_off_action:
+      - button.press: light_toggle
+
+button:
+  - platform: template
+    name: "${friendly_name} Light Toggle"
+    id: light_toggle
+    internal: True
+    on_press:
+      then:
+        - output.turn_on: latch_trigger
+        - delay: 100ms
+        - output.turn_off: latch_trigger
+        - delay: 100ms
+        - component.update: light_on_adc
+        - script.execute: update_light_out_adc
+
+output:
+  - platform: ledc
+    id: statusled
+    pin:
+      number: ${status_led_pin}
+  - platform: gpio
+    id: latch_trigger
+    pin:
+      number: ${latch_trigger_output_pin}
+    inverted: true
+
+light:
+  - platform: monochromatic
+    id: led1
+    name: "LED"
+    output: statusled
+    internal: True
+
+binary_sensor:
+  - platform: template
+    name: "${friendly_name} UPS Active"
+    id: ups_active
+    device_class: power
+    lambda: 'return id(ups_active_pulse);'
+  - platform: gpio
+    name: "${friendly_name} Input Button"
+    id: input_button
+    pin:
+      number: ${input_button_pin}
+      mode: INPUT_PULLUP
+      inverted: true
+    internal: True
+    on_press:
+        then:
+          - if:
+              condition:
+                script.is_running: led_breathe
+              then:
+                - script.stop: led_breathe
+                - light.turn_off:
+                    id: led1
+                    transition_length: 0ms
+                - delay: 100ms
+          - light.turn_on:
+              id: led1
+              transition_length: 0ms
+    on_release:
+          - light.turn_off:
+              id: led1
+              transition_length: 0ms
+          - if:
+              condition:
+                lambda: 'return id(led_breathe_script_running);'
+              then:
+                script.execute: led_breathe
+
+
+text_sensor:
+  - platform: version
+    name: "${friendly_name} ESPHome Version"
+    id: esphome_version
+    hide_timestamp: True
+    entity_category: diagnostic
+  - platform: wifi_info
+    ip_address:
+      id: wifi_ip
+      name: "${friendly_name} IP Address"
+      entity_category: diagnostic
+    ssid:
+      id: wifi_ssid
+      name: "${friendly_name} SSID"
+      entity_category: diagnostic
+  - platform: template
+    name: "${friendly_name} ${project_name} Version"
+    id: project_version
+    lambda: |-
+      return {"${project_version}"};
+    entity_category: diagnostic
+  - platform: template
+    name: "${friendly_name} Wake Reason"
+    id: wake_reason
+    lambda: |-
+      switch (id(wakeup_reason)) {
+        case 0: return {"Normal Boot"};
+        case 1: return {"GPIO Button"};
+        case 2: return {"RTC GPIO Button"};
+        case 3: return {"Timer"};
+        case 4: return {"Touchpad"};
+        case 5: return {"ULP"};
+        default: return {"Other"};
+      }
+    update_interval: never
+    entity_category: diagnostic
+
+number:
+  - platform: template
+    name: "${friendly_name} Sleep Duration"
+    id: sleep_duration
+    optimistic: true
+    min_value: 10
+    max_value: 240
+    step: 1
+    unit_of_measurement: "minutes"
+    mode: box
+    device_class: duration
+    restore_value: true
+    initial_value: ${sleep_duration}
+    on_value:
+      then:
+        - lambda: 'id(sleep_duration_seconds) = (int)(x * 60);'
+        - logger.log:
+            format: "Sleep Duration set to %.0f minutes"
+            args: ['x']
